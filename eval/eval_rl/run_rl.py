@@ -34,6 +34,14 @@ from envs.neural_environment import NeuralEnvironment
 from utils.python_utils import set_random_seed, get_time_stamp  
 from envs.warp_sim_envs import RenderMode
 
+import numpy as np
+# Loads from Pytorch 2.2.2 .pth so trust old np types
+torch.serialization.add_safe_globals([
+    np.dtypes.Float32DType,
+    np.core.multiarray.scalar,
+    np.dtype
+])
+
 def get_args():
     parser = argparse.ArgumentParser("")
     parser.add_argument("--rl-cfg", 
@@ -170,7 +178,7 @@ def construct_env(env_specs, device, args):
         
     # Load neural model and neural_integrator_cfg if env_mode is "neural"
     if env_specs['env_mode'] == "neural":
-        neural_model, robot_name = torch.load(env_specs['model_path'], map_location=device)
+        neural_model, robot_name = torch.load(env_specs['model_path'], map_location=device, weights_only=False)
         neural_model.to(device)
 
         train_dir = os.path.abspath(

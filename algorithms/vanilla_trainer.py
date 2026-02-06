@@ -83,7 +83,7 @@ class VanillaTrainer:
                 device = self.device
             )
         else:
-            checkpoint = torch.load(model_checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(model_checkpoint_path, map_location=self.device, weights_only=False)
             self.neural_model = checkpoint[0]
             self.neural_model.to(self.device)
         

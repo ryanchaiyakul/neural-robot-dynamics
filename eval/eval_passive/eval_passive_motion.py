@@ -94,7 +94,8 @@ if __name__ == '__main__':
 
     # Load neural model and neural_integrator_cfg if model_path exists
     if args.model_path is not None:
-        model, robot_name = torch.load(args.model_path, map_location='cuda:0')
+        # PyTorch 2.6.0 defaults to weights_only = True
+        model, robot_name = torch.load(args.model_path, map_location='cuda:0', weights_only=False)
         print('Number of Model Parameters: ', num_params_torch_model(model))
         model.to(device)
         train_dir = os.path.abspath(os.path.join(
