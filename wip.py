@@ -31,6 +31,7 @@
 import numpy as np
 
 import warp as wp
+import warp.sim
 import warp.render
 
 
@@ -266,127 +267,9 @@ def initialize_particles(
     particle_x[tid] = pos
 
 
-class Example:
-    def __init__(self, stage_path="example_sph.usd", verbose=False):
-        self.verbose = verbose
-
-        # render params
-        fps = 60
-        self.frame_dt = 1.0 / fps
-        self.sim_time = 0.0
-
-        # simulation params
-        self.smoothing_length = 0.8  # NOTE change this to adjust number of particles
-        self.width = 80.0  # x
-        self.height = 80.0  # y
-        self.length = 80.0  # z
-        self.isotropic_exp = 20
-        self.base_density = 1.0
-        self.particle_mass = 0.01 * self.smoothing_length**3  # reduce according to smoothing length
-        self.dt = 0.01 * self.smoothing_length  # decrease sim dt by smoothing length
-        self.dynamic_visc = 0.025
-        self.damping_coef = -0.95
-        self.gravity = -0.1
-        self.n = int(
-            self.height * (self.width / 4.0) * (self.height / 4.0) / (self.smoothing_length**3)
-        )  # number particles (small box in corner)
-        self.sim_step_to_frame_ratio = int(32 / self.smoothing_length)
-
-        # constants
-        self.density_normalization = (315.0 * self.particle_mass) / (
-            64.0 * np.pi * self.smoothing_length**9
-        )  # integrate density kernel
-        self.pressure_normalization = -(45.0 * self.particle_mass) / (np.pi * self.smoothing_length**6)
-        self.viscous_normalization = (45.0 * self.dynamic_visc * self.particle_mass) / (
-            np.pi * self.smoothing_length**6
-        )
-
-        # allocate arrays
-        self.x = wp.empty(self.n, dtype=wp.vec3)
-        self.v = wp.zeros(self.n, dtype=wp.vec3)
-        self.rho = wp.zeros(self.n, dtype=float)
-        self.a = wp.zeros(self.n, dtype=wp.vec3)
-
-        # set random positions
-        wp.launch(
-            kernel=initialize_particles,
-            dim=self.n,
-            inputs=[self.x, self.smoothing_length, self.width, self.height, self.length],
-        )  # initialize in small area
-
-        # create hash array
-        grid_size = int(self.height / (4.0 * self.smoothing_length))
-        self.grid = wp.HashGrid(grid_size, grid_size, grid_size)
-
-        # renderer
-        self.renderer = None
-        if stage_path:
-            self.renderer = wp.render.UsdRenderer(stage_path)
-
-    def step(self):
-        with wp.ScopedTimer("step"):
-            for _ in range(self.sim_step_to_frame_ratio):
-                with wp.ScopedTimer("grid build", active=self.verbose):
-                    # build grid
-                    self.grid.build(self.x, self.smoothing_length)
-
-                with wp.ScopedTimer("forces", active=self.verbose):
-                    # compute density of points
-                    wp.launch(
-                        kernel=compute_density,
-                        dim=self.n,
-                        inputs=[self.grid.id, self.x, self.rho, self.density_normalization, self.smoothing_length],
-                    )
-
-                    # get new acceleration
-                    wp.launch(
-                        kernel=get_acceleration,
-                        dim=self.n,
-                        inputs=[
-                            self.grid.id,
-                            self.x,
-                            self.v,
-                            self.rho,
-                            self.a,
-                            self.isotropic_exp,
-                            self.base_density,
-                            self.gravity,
-                            self.pressure_normalization,
-                            self.viscous_normalization,
-                            self.smoothing_length,
-                        ],
-                    )
-
-                    # apply bounds
-                    wp.launch(
-                        kernel=apply_bounds,
-                        dim=self.n,
-                        inputs=[self.x, self.v, self.damping_coef, self.width, self.height, self.length],
-                    )
-
-                    # kick
-                    wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, self.dt])
-
-                    # drift
-                    wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.dt])
-
-            self.sim_time += self.frame_dt
-
-    def render(self):
-        if self.renderer is None:
-            return
-
-        with wp.ScopedTimer("render"):
-            self.renderer.begin_frame(self.sim_time)
-            self.renderer.render_points(
-                points=self.x.numpy(), radius=self.smoothing_length, name="points", colors=(0.8, 0.3, 0.2)
-            )
-            self.renderer.end_frame()
-
-
 # One-way coupling
 
-# Helper for primitives
+# Helper functions for primitives
 @wp.func
 def sdf_box(p: wp.vec3, box_size: wp.vec3):
     q = wp.abs(p) - box_size
@@ -476,3 +359,284 @@ def collide_particles_with_robot(
     
     particle_x[tid] = p_world
     particle_v[tid] = v_world
+
+
+class Example:
+    def __init__(self, stage_path="example_sph.usd", verbose=False):
+        self.verbose = verbose
+
+        # ANYmal
+        builder = wp.sim.ModelBuilder()
+        urdf_path = "envs/warp_sim_envs/assets/ant.xml"
+        wp.sim.parse_mjcf(urdf_path, 
+        builder,
+            armature=0.05,
+            contact_ke=4.e4,
+            contact_kd=1.e2,
+            contact_kf=3.e3,
+            contact_mu=0.75,
+            limit_ke=1.0e3,
+            limit_kd=1.0e2,
+            enable_self_collisions=False,
+            up_axis="y",
+            collapse_fixed_joints=True,
+        )
+
+        self.start_rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -warp.pi * 0.5)
+        self.inv_start_rot = wp.quat_inverse(self.start_rot)
+
+        self.robot_model = builder.finalize()
+        self.scale_robot_model(20.0)
+        self.robot_state = self.robot_model.state()
+
+        # render params
+        fps = 60
+        self.frame_dt = 1.0 / fps
+        self.sim_time = 0.0
+
+        # simulation params
+        self.smoothing_length = 0.8  # NOTE change this to adjust number of particles
+        self.width = 10.0  # x
+        self.height = 10.0  # y
+        self.length = 10.0  # z
+        self.isotropic_exp = 20
+        self.base_density = 1.0
+        self.particle_mass = 0.01 * self.smoothing_length**3  # reduce according to smoothing length
+        self.dt = 0.01 * self.smoothing_length  # decrease sim dt by smoothing length
+        self.dynamic_visc = 0.025
+        self.damping_coef = -0.95
+        self.gravity = -9.81
+        self.n = int(
+            self.height * (self.width / 4.0) * (self.height / 4.0) / (self.smoothing_length**3)
+        )  # number particles (small box in corner)
+        self.sim_step_to_frame_ratio = int(32 / self.smoothing_length)
+
+        # constants
+        self.density_normalization = (315.0 * self.particle_mass) / (
+            64.0 * np.pi * self.smoothing_length**9
+        )  # integrate density kernel
+        self.pressure_normalization = -(45.0 * self.particle_mass) / (np.pi * self.smoothing_length**6)
+        self.viscous_normalization = (45.0 * self.dynamic_visc * self.particle_mass) / (
+            np.pi * self.smoothing_length**6
+        )
+
+        # allocate arrays
+        self.x = wp.empty(self.n, dtype=wp.vec3)
+        self.v = wp.zeros(self.n, dtype=wp.vec3)
+        self.rho = wp.zeros(self.n, dtype=float)
+        self.a = wp.zeros(self.n, dtype=wp.vec3)
+
+        # set random positions
+        wp.launch(
+            kernel=initialize_particles,
+            dim=self.n,
+            inputs=[self.x, self.smoothing_length, self.width, self.height, self.length],
+        )  # initialize in small area
+
+        # create hash array
+        grid_size = int(self.height / (4.0 * self.smoothing_length))
+        self.grid = wp.HashGrid(grid_size, grid_size, grid_size)
+
+        # renderer
+        self.renderer = None
+        if stage_path:
+            self.renderer = wp.render.UsdRenderer(stage_path)
+
+    def step(self):
+        with wp.ScopedTimer("step"):
+            for _ in range(self.sim_step_to_frame_ratio):
+                q_np = self.robot_state.joint_q.numpy()
+                # Move forward 0.5m/s
+                q_np[0] = self.sim_time * 0.5  
+            
+                # Bob up and down to splash
+                q_np[1] = 0.55 + np.sin(self.sim_time * 5.0) * 0.1
+
+                # 1. Set Position (Floating Base px, py, pz)
+                # World is Y-up, so we lift it in Y
+                q_np[0] = 0.0
+                q_np[1] = 1.0 # Lift it up 1 meter
+                q_np[2] = 0.0
+
+                # 2. Set Orientation (Floating Base qx, qy, qz, qw)
+                # We perform the EXACT rotation from the NERD code:
+                # -90 degrees around X-axis
+                rot_quat = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -np.pi * 0.5)
+                
+                q_np[3] = rot_quat[0]
+                q_np[4] = rot_quat[1]
+                q_np[5] = rot_quat[2]
+                q_np[6] = rot_quat[3]
+                
+                # Apply to Warp state
+                self.robot_state.joint_q = wp.from_numpy(q_np, dtype=float)
+
+                with wp.ScopedTimer("grid build", active=self.verbose):
+                    # build grid
+                    self.grid.build(self.x, self.smoothing_length)
+
+                with wp.ScopedTimer("forces", active=self.verbose):
+                    # compute density of points
+                    wp.launch(
+                        kernel=compute_density,
+                        dim=self.n,
+                        inputs=[self.grid.id, self.x, self.rho, self.density_normalization, self.smoothing_length],
+                    )
+
+                    # get new acceleration
+                    wp.launch(
+                        kernel=get_acceleration,
+                        dim=self.n,
+                        inputs=[
+                            self.grid.id,
+                            self.x,
+                            self.v,
+                            self.rho,
+                            self.a,
+                            self.isotropic_exp,
+                            self.base_density,
+                            self.gravity,
+                            self.pressure_normalization,
+                            self.viscous_normalization,
+                            self.smoothing_length,
+                        ],
+                    )
+
+                    wp.launch(
+                        kernel=collide_particles_with_robot,
+                        dim=self.n,
+                        inputs=[
+                            self.x, self.v,
+                            self.robot_state.body_q,
+                            self.robot_model.shape_transform,
+                            self.robot_model.shape_body,
+                            self.robot_model.shape_geo,
+                            self.robot_model.shape_count,
+                            0.5,
+                            self.smoothing_length * 0.5
+                        ]
+                    )
+
+                    # apply bounds
+                    wp.launch(
+                        kernel=apply_bounds,
+                        dim=self.n,
+                        inputs=[self.x, self.v, self.damping_coef, self.width, self.height, self.length],
+                    )
+
+                    # kick
+                    wp.launch(kernel=kick, dim=self.n, inputs=[self.v, self.a, self.dt])
+
+                    # drift
+                    wp.launch(kernel=drift, dim=self.n, inputs=[self.x, self.v, self.dt])
+
+            self.sim_time += self.frame_dt
+
+    
+    def render(self):
+        if self.renderer is None:
+            return
+
+        with wp.ScopedTimer("render"):
+            self.renderer.begin_frame(self.sim_time)
+            
+            # Render Fluid
+            self.renderer.render_points(
+                points=self.x.numpy(), radius=self.smoothing_length, name="points", colors=(0.8, 0.3, 0.2)
+            )
+            
+            # --- 1. Get Data from GPU to CPU (NumPy) ---
+            body_q_np = self.robot_state.body_q.numpy()
+            shape_xform_np = self.robot_model.shape_transform.numpy()
+            shape_geo_type_np = self.robot_model.shape_geo.type.numpy()
+            shape_geo_scale_np = self.robot_model.shape_geo.scale.numpy()
+            shape_body_np = self.robot_model.shape_body.numpy()
+
+            # --- 2. Iterate Over Robot Shapes ---
+            for i in range(self.robot_model.shape_count):
+                body_idx = shape_body_np[i]
+
+                # [FIX] Manually unpack NumPy arrays into Warp types
+                # Body Transform (World -> Body)
+                bq = body_q_np[body_idx] # This is a 7-float array
+                X_wb = wp.transform(
+                    wp.vec3(bq[0], bq[1], bq[2]),
+                    wp.quat(bq[3], bq[4], bq[5], bq[6])
+                )
+
+                # Shape Transform (Body -> Shape)
+                sq = shape_xform_np[i] # This is a 7-float array
+                X_bs = wp.transform(
+                    wp.vec3(sq[0], sq[1], sq[2]),
+                    wp.quat(sq[3], sq[4], sq[5], sq[6])
+                )
+                
+                # Compute Global Transform (World -> Shape)
+                X_ws = wp.transform_multiply(X_wb, X_bs)
+                
+                # Extract pos/rot for the renderer
+                pos = wp.transform_get_translation(X_ws)
+                rot = wp.transform_get_rotation(X_ws)
+                
+                # Get geometry info
+                geo_type = shape_geo_type_np[i]
+                scale = shape_geo_scale_np[i] # This is a 3-float array
+                name = f"robot_shape_{i}"
+
+                # Render based on type
+                if geo_type == wp.sim.GEO_SPHERE:
+                    # scale[0] is radius
+                    self.renderer.render_sphere(name, pos, rot, radius=float(scale[0]))
+                    
+                elif geo_type == wp.sim.GEO_BOX:
+                    # scale is (x, y, z) extents
+                    self.renderer.render_box(name, pos, rot, extents=tuple(scale))
+                    
+                elif geo_type == wp.sim.GEO_CAPSULE:
+                    # scale[0] = radius, scale[1] = half_height
+                    self.renderer.render_capsule(name, pos, rot, radius=float(scale[0]), half_height=float(scale[1]))
+                
+                elif geo_type == wp.sim.GEO_MESH:
+                    # Fallback for meshes -> Draw a small proxy sphere so we can see where it is
+                    self.renderer.render_sphere(name, pos, rot, radius=0.05)
+            
+            self.renderer.end_frame()
+
+    
+    def scale_robot_model(self, scale_factor):
+        joint_X_np = self.robot_model.joint_X_p.numpy()
+        joint_X_np[:, :3] *= scale_factor
+        self.robot_model.joint_X_p = wp.from_numpy(joint_X_np, dtype=wp.transform)
+        shape_scale_np = self.robot_model.shape_geo.scale.numpy()
+        shape_scale_np *= scale_factor
+        self.robot_model.shape_geo.scale = wp.from_numpy(shape_scale_np, dtype=wp.vec3)
+        shape_X_np = self.robot_model.shape_transform.numpy()
+        shape_X_np[:, :3] *= scale_factor
+        self.robot_model.shape_transform = wp.from_numpy(shape_X_np, dtype=wp.transform)
+        
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--device", type=str, default=None, help="Override the default Warp device.")
+    parser.add_argument(
+        "--stage_path",
+        type=lambda x: None if x == "None" else str(x),
+        default="example_sph.usd",
+        help="Path to the output USD file.",
+    )
+    parser.add_argument("--num_frames", type=int, default=480, help="Total number of frames.")
+    parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
+
+    args = parser.parse_known_args()[0]
+
+    with wp.ScopedDevice(args.device):
+        example = Example(stage_path=args.stage_path, verbose=args.verbose)
+
+        for _ in range(args.num_frames):
+            example.render()
+            example.step()
+
+        if example.renderer:
+            example.renderer.save()
